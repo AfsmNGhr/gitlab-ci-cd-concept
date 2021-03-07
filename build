@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+
+stack=${1:-example}
+env=${2:-staging}
+group=${3:-"$env"}
+stacks="$(find services/* -maxdepth 1 -type d | awk -F/ '{print $NF}')"
+
+prepare_stack () {
+    source <(find "services/$stack" -type f -name '.env' -exec sed -E -n 's/[^#]+/export &/ p' {} +)
+
+    service=".*\\/$stack"
+    conf="\\.$env"
+    child=".*"
+    regex="$service\\/\\($child\\)?docker-compose\\($conf\\)?\\.yml$"
+
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        cmd="find -E services/ -regex $regex"
+    else
+        cmd="find services/ -regextype posix-extended -regex $regex"
+    fi
+
+    files=$(sh -c "$cmd | xargs -I \"%\" echo '-f' \"%\" | tr '\\n' ' '")
+
+    # WARNING: Don't quote $files
+
+    docker-compose $files config > docker-compose.stack.yml
+}
+
+sync_stack () {
+    git="$(find "services/$stack" -name '.git*')"
+    if [ -n "$git" ]; then
+        git submodule update --init --remote --merge "services/$stack"
+    fi
+}
+
+generate_stack_name () {
+    if [ -n "$CI_COMMIT_REF_SLUG" ]; then
+        stack_name="${CI_COMMIT_REF_SLUG}_${stack}"
+    else
+        stack_name="$stack"
+    fi
+}
+
+cleanup () {
+    rm -f docker-compose.stack.yml
+}
+
+if [ -n "$CI" ]; then
+    ansible-playbook() {
+        lock='/tmp/build.lock'
+
+        # Check if lock exists, restart if yes
+        ssh "${CI_USER}@${CI_HOST}" test -e "$lock"
+
+        if [ "$?" -eq 0 ]; then
+            processes=$(ssh "${CI_USER}@${CI_HOST}" "ps -aux | grep [a]nsible/playbooks/build | wc -l")
+
+            if [ "$processes" -eq 0 ]; then
+                # Prevent anomaly, if lock exists and build isn't running
+                ssh "${CI_USER}@${CI_HOST}" rm "$lock"
+            else
+                # WARNING: Sorry, someone is running already build!
+                # The pipeline will be restart as delayed job.
+
+                DELAYED='true' ./bin/pipeline --new
+                ./bin/pipeline --cancel
+                sleep 30
+            fi
+        fi
+
+        # Create lock file ON CI_HOST, saving $CI_COMMIT_REF_SLUG
+        ssh "${CI_USER}@${CI_HOST}" "bash -s" << CMD
+            echo "$CI_COMMIT_REF_SLUG" > "$lock"
+CMD
+        # Run ansible with arguments passed at the command line
+        `which ansible-playbook` "$@"
+
+        status_code="$?"
+
+        # Remove lock file
+        ssh "${CI_USER}@${CI_HOST}" rm "$lock"
+
+        return "$status_code"
+    }
+fi
+
+build () {
+    sync_stack
+    prepare_stack
+    generate_stack_name
+
+    time ansible-playbook ansible/playbooks/build.yml -i "ansible/environments/$env" \
+         -e "{\"project_path\": \"$(pwd)\", \"env\": \"$env\", \"group\": \"$group\", \"stack\": \"$stack_name\"}"
+
+    status_code="$?"
+    [ "$status_code" != 0 ] && exit 1
+
+    cleanup
+}
+
+help () {
+    echo "Usage: $0"
+    echo 'Default: *'
+    echo 'Stacks: *example'
+    echo ''
+    echo "$stacks"
+    echo ''
+    echo 'Environments: *staging'
+    exit 1
+}
+
+if [ ! -d "services/$stack" ]; then
+    help
+fi
+
+# WARNING: Don't delete quotes $stacks
+
+for i in "$stacks"; do
+    case "$i" in
+        *$stack*)
+            case "$env" in
+                'staging'|'production')
+                    build
+                    ;;
+                *)
+                    help
+                    ;;
+            esac
+            ;;
+        *)
+            help
+            ;;
+    esac
+done

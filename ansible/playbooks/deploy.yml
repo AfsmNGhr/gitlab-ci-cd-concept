@@ -1,0 +1,7 @@
+---
+
+- name: Deploy services
+  hosts: '{{ group }}'
+  gather_facts: no
+  roles:
+    - deploy

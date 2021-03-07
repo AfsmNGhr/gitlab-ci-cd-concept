@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+
+errors=0
+
+if [[ -z "$CI_COMMIT_TAG" ]]; then
+    echo 'ERROR: Please provide $CI_COMMIT_TAG'
+    errors+=1
+fi
+
+if [[ -z "$RELEASE_TOKEN" ]]; then
+    echo 'ERROR: Please provide $RELEASE_TOKEN'
+    errors+=1
+fi
+
+if [[ -z "$API_PROJECT_URL" ]]; then
+    echo 'ERROR: Please provide $API_PROJECT_URL'
+    errors+=1
+fi
+
+if [[ -z "$1" ]]; then
+    echo 'ERROR: Please provide a source file'
+    errors+=1
+fi
+
+if [[ "$errors" > 0 ]]; then
+    exit 1
+fi
+
+cmd="$(printf "%s" "/^### \[$CI_COMMIT_TAG\].*$/,/^[#].*$/p")"
+description="$(sed -n "$cmd" "$1" | head -n -1)"
+
+if [[ -z "$description" ]]; then
+    echo "ERROR: The description does not exist for $CI_COMMIT_TAG"
+    exit 1
+fi
+
+curl -sSfo /dev/null -X POST \
+     -H "PRIVATE-TOKEN: $RELEASE_TOKEN" \
+     -F "name=$CI_COMMIT_TAG" \
+     -F "tag_name=$CI_COMMIT_TAG" \
+     -F "description=$description" \
+     "${API_PROJECT_URL}/releases"

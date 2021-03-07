@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+
+source_volume="${1:-staging_pg_data}"
+destination_volume="$2"
+
+if [[ -z "$destination_volume" ]]; then
+    if [ -n "$CI_COMMIT_REF_SLUG" ]; then
+        destination_volume="${CI_COMMIT_REF_SLUG}_${COMPOSE_PROJECT_NAME}_pg_data"
+    else
+        destination_volume="${COMPOSE_PROJECT_NAME:-test}_pg_data"
+    fi
+fi
+
+if [[ -z "$source_volume" ]]; then
+    echo 'ERROR: Please provide a source volume name'
+    exit 1
+fi
+
+if [[ -z "$destination_volume" ]]; then
+    echo 'ERROR: Please provide a destination volume name'
+    exit 1
+fi
+
+# Check if the source volume name does exist
+docker volume inspect "$source_volume" > /dev/null 2>&1
+
+if [ "$?" -ne 0 ]; then
+    echo "ERROR: The source volume \"$source_volume\" does not exist"
+    exit 1
+fi
+
+# Now check if the destination volume name does not yet exist
+docker volume inspect "$destination_volume" > /dev/null 2>&1
+
+if [ "$?" -eq 0 ]; then
+    echo "WARNING: The destination volume \"$destination_volume\" already exists"
+    exit 0
+fi
+
+echo "INFO: Creating destination volume \"$destination_volume\"..."
+docker volume create --name "$destination_volume"
+
+echo "INFO: Copying data from source volume \"$source_volume\" to destination volume \"$destination_volume\"..."
+docker run --rm \
+           -i \
+           -v "$source_volume:/from" \
+           -v "$destination_volume:/to" \
+           afsmnghr/rsync:1.0.0 rsync -a /from/ /to/

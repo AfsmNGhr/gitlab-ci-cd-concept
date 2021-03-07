@@ -1,0 +1,330 @@
+---
+image: afsmnghr/ansible-gitlab-runner:1.3.0
+
+variables:
+  GIT_STRATEGY: fetch
+  GIT_DEPTH: 1
+  DOCKER_HOST: "${DOCKER_HOST}"
+  ANSIBLE_FORCE_COLOR: '1'
+  PY_COLORS: '1'
+  COMPOSE_PROJECT_NAME: example
+  BASE_DOMAIN: example.com
+  DELAYED: 'false'
+  DEPLOY: 'false'
+  CI_HOST: "${CI_HOST}"
+  CI_USER: "${CI_USER}"
+  PG_VOLUME_NAME: staging_pg_data
+  API_PROJECT_URL: https://gitlab.example.com/api/v4/projects/1
+
+# INFO: How to validate this:
+# docker run -i --rm -v ${PWD}/.gitlab-ci.yml:/yaml/.gitlab-ci.yml registry.gitlab.com/comedian780/docker-gitlab-ci-validate
+
+stages:
+  - test
+  - integration
+  - staging
+  - production
+
+.ssh: &ssh |
+  # INFO: Access via ssh
+  eval "$(ssh-agent -s)"
+  ssh-add - <<< "${SSH_PRIVATE_KEY}"
+  mkdir -p ~/.ssh
+  ssh-keyscan "$CI_HOST" >> ~/.ssh/known_hosts
+  ssh-keyscan "$PROD_HOST" >> ~/.ssh/known_hosts
+
+.ansible: &ansible |
+  # WARNING: Ansible refuses to read from a world-writeable folder
+  chmod -v 600 "$(pwd)"
+  # INFO: Create ansible vault pass file
+  # TODO: Use ansible-vault without a pass file
+  echo "$ANSIBLE_VAULT_PASS" > .vault
+
+.restart: &restart |
+  ./bin/pipeline --new
+
+.cancel: &cancel |
+  ./bin/pipeline --cancel
+
+.unlock: &unlock |
+  ssh "${CI_USER}@${CI_HOST}" rm -f /tmp/build.lock
+
+.sync: &sync |
+  processes=$(ssh "${PROD_USER}@${PROD_HOST}" "ps -aux | grep [p]g_dump | wc -l")
+  if [ "$processes" -gt 0 ]; then
+    echo 'Please, wait while backup is ending on production server!!!'
+    exit 1
+  fi
+  export COMPOSE_PROJECT_NAME=staging
+  DOCKER_HOST="ssh://${PROD_USER}@${PROD_HOST}" docker cp pg2s3_backup_1:/dump.sql.gz .
+  pigz -d -p3 dump.sql.gz
+  docker volume rm -f "$PG_VOLUME_NAME"
+  docker-compose -f docker-compose.sync.yml up -d pg
+  sleep 10
+  # WARNING: Backup failed from stdin if docker host via ssh
+  docker cp dump.sql staging_pg_1:/
+  rm -f dump.sql
+  docker exec -i staging_pg_1 psql -U "$PG_STAGING_USER" -d "$PG_STAGING_DB" -f /dump.sql
+  docker exec staging_pg_1 rm -f /dump.sql
+  docker stop staging_pg_1
+  docker rm -f staging_pg_1
+
+.down: &down |
+  stack_name="${CI_COMMIT_REF_SLUG}_${COMPOSE_PROJECT_NAME}"
+  docker ps -q -f "label=com.docker.compose.project=$stack_name" | xargs --no-run-if-empty docker rm -f
+  docker volume ls -q -f "name=${stack_name}*" | xargs --no-run-if-empty docker volume rm -f
+  docker network ls -q -f "label=com.docker.compose.project=$stack_name" | xargs --no-run-if-empty docker network rm
+
+Cleanup:
+  stage: test
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - docker builder prune -af --filter 'unused-for=24h'
+    - docker container prune -f
+    - docker network prune -f
+    - docker image prune -af --filter 'until=120h'
+    - docker volume ls -qf 'dangling=true' | grep -v "$PG_VOLUME_NAME" | xargs --no-run-if-empty docker volume rm || true
+    - exit 0
+  only:
+    refs:
+      - schedules
+
+Test (API):
+  stage: test
+  variables:
+    COMPOSE_PROJECT_NAME: "${CI_COMMIT_REF_SLUG}_test"
+  script:
+    - docker-compose -f docker-compose.test.yml build api
+  only:
+    refs:
+      - tags
+      - merge_requests
+      - develop
+    changes:
+      - api/**/*
+  except:
+    refs:
+      - schedules
+    changes:
+      - api/*.md
+      - api/Dockerfile*
+      - api/.*ignore
+
+Test (WEB):
+  stage: test
+  script:
+    - docker-compose -f docker-compose.test.yml build web
+  only:
+    refs:
+      - tags
+      - merge_requests
+      - develop
+    changes:
+      - web/**/*
+  except:
+    refs:
+      - schedules
+    changes:
+      - web/*.md
+      - web/nginx/*
+      - web/Dockerfile*
+      - web/.*ignore
+
+Clone Database:
+  stage: integration
+  script:
+    - ./bin/clone_volume $PG_VOLUME_NAME
+  only:
+    variables:
+      - $DEPLOY == 'true'
+    refs:
+      - triggers
+      - merge_requests
+      - develop
+  except:
+    variables:
+      - $DELAYED == 'true'
+    refs:
+      - schedules
+
+Build App Stack:
+  stage: integration
+  before_script:
+    - *ansible
+  script:
+    - ./build example staging
+  after_script:
+    - rm -f .vault
+  only:
+    variables:
+      - $DEPLOY == 'true'
+    refs:
+      - triggers
+      - merge_requests
+      - develop
+  except:
+    variables:
+      - $DELAYED == 'true'
+    refs:
+      - schedules
+
+Delayed Job:
+  stage: integration
+  script:
+    - export DELAYED='false'
+    - *restart
+  when: delayed
+  start_in: 10 minutes
+  only:
+    variables:
+      - $DELAYED == 'true'
+
+Forced Build:
+  stage: integration
+  variables:
+    DELAYED: 'false'
+    DEPLOY: 'true'
+  before_script:
+    - *ssh
+    - *unlock
+  script:
+    - *restart
+    - *cancel
+  when: manual
+  only:
+    refs:
+      - triggers
+      - merge_requests
+      - develop
+  except:
+    refs:
+      - schedules
+
+Deploy App Stack:
+  stage: staging
+  before_script:
+    - *ssh
+    - *ansible
+  script:
+    - ./deploy example staging
+  after_script:
+    - rm -f .vault
+  only:
+    variables:
+      - $DEPLOY == 'true'
+    refs:
+      - triggers
+      - merge_requests
+      - develop
+  except:
+    variables:
+      - $DELAYED == 'true'
+    refs:
+      - schedules
+  environment:
+    name: "$CI_COMMIT_REF_SLUG"
+    url: "https://${CI_ENVIRONMENT_SLUG}.${BASE_DOMAIN}"
+    on_stop: 'Stop Review-App'
+    auto_stop_in: 4 hours
+
+Stop Review-App:
+  stage: integration
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - *down
+  when: manual
+  only:
+    - triggers
+    - merge_requests
+    - develop
+  except:
+    refs:
+      - schedules
+  environment:
+    name: "$CI_COMMIT_REF_SLUG"
+    action: stop
+
+Sync with Prod DB:
+  stage: staging
+  variables:
+    DEPLOY: 'true'
+  before_script:
+    - *ssh
+    - *down
+  script:
+    - *sync
+    - *restart
+  when: manual
+  only:
+    - triggers
+    - merge_requests
+    - develop
+  except:
+    refs:
+      - schedules
+
+Start Review-App:
+  stage: staging
+  variables:
+    DEPLOY: 'true'
+  script:
+    - *restart
+  when: manual
+  only:
+    - triggers
+    - merge_requests
+    - develop
+  except:
+    refs:
+      - schedules
+
+Create Release:
+  stage: test
+  script:
+    - ./bin/release CHANGELOG.md
+  only:
+    - tags
+  except:
+    - schedules
+    - branches
+    - develop
+
+Build Release:
+  stage: integration
+  before_script:
+    - *ssh
+    - *ansible
+  script:
+    - ./build example production
+  after_script:
+    - rm -f .vault
+  only:
+    - tags
+  except:
+    variables:
+      - $DELAYED == 'true'
+    refs:
+      - schedules
+      - branches
+      - develop
+
+Deploy Release:
+  stage: production
+  before_script:
+    - *ssh
+    - *ansible
+  script:
+    - CI_COMMIT_REF_SLUG= ./deploy example production
+  after_script:
+    - rm -f .vault
+  only:
+    - tags
+  except:
+    variables:
+      - $DELAYED == 'true'
+    refs:
+      - schedules
+      - branches
+      - develop

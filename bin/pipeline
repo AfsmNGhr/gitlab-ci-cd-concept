@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+
+function new() {
+    curl -sSfo /dev/null -X POST \
+         -F "token=$PIPELINE_TOKEN" \
+         -F "ref=$CI_COMMIT_REF_NAME" \
+         -F "variables[DELAYED]=$DELAYED" \
+         -F "variables[DEPLOY]=$DEPLOY" \
+         "${API_PROJECT_URL}/trigger/pipeline"
+}
+
+function cancel() {
+    curl -sSfo /dev/null -X POST \
+         -H "PRIVATE-TOKEN: $RELEASE_TOKEN" \
+         "${API_PROJECT_URL}/pipelines/${CI_PIPELINE_ID}/cancel"
+}
+
+help () {
+    echo "Usage: $0"
+    echo ''
+    echo '-n|--new       create new pipeline'
+    echo '-c|--cancel    cancel the pipeline'
+    echo ''
+}
+
+
+case "$1" in
+    '-n'|'--new')
+        new
+        ;;
+    '-c'|'--cancel')
+        cancel
+        ;;
+    *)
+        help
+        ;;
+esac

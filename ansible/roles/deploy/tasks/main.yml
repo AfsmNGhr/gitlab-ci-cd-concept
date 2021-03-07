@@ -1,0 +1,28 @@
+---
+
+- name: Login to private registry
+  # IMPORTANT: use "****" for password (maybe ' or another symbols)
+  docker_login:
+    registry: "{{ services.registry.domain }}"
+    username: "{{ services.registry.user }}"
+    password: "{{ services.registry.password }}"
+    reauth: yes
+  when: env != 'test' or stack == 'traefik'
+
+- name: Prepare a stack file
+  template:
+    src: 'stack.yml.j2'
+    dest: '/tmp/{{ stack }}.yml'
+
+- name: Deploy stack
+  docker_stack:
+    state: present
+    name: '{{ stack }}'
+    with_registry_auth: '{{ env != "test" }}'
+    compose:
+      - '/tmp/{{ stack }}.yml'
+
+- name: Delete a stack file
+  file:
+    state: absent
+    path: '/tmp/{{ stack }}.yml'
