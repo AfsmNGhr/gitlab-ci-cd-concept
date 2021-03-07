@@ -2,7 +2,7 @@
 
 Features:
 
-- Full-dockerized & artifactless (use multi-stage build for tests, run scheduled cleanup action with ttl)
+- Full-dockerized & artifactless (use multi-stage build for everything, run scheduled cleanup with ttl)
 - Use ansible build & deploy roles
 - Reuse action with Trigger API & Project API
 - Delayed job with ttl (use lock for only build one at a time)
